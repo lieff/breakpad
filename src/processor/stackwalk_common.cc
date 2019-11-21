@@ -264,10 +264,11 @@ static void PrintStack(const CallStack *stack,
     printf("%2d  ", frame_index);
 
     uint64_t instruction_address = frame->ReturnAddress();
-
+    bool good = false;
     if (frame->module) {
       printf("%s", PathnameStripper::File(frame->module->code_file()).c_str());
       if (!frame->function_name.empty()) {
+        good = true;
         printf("!%s", frame->function_name.c_str());
         if (!frame->source_file_name.empty()) {
           string source_file = PathnameStripper::File(frame->source_file_name);
@@ -285,7 +286,10 @@ static void PrintStack(const CallStack *stack,
     } else {
       printf("0x%" PRIx64, instruction_address);
     }
-    printf("\n ");
+    printf("\n");
+    if (good)
+      continue;
+    printf(" ");
 
     int sequence = 0;
     if (cpu == "x86") {
