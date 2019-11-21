@@ -169,6 +169,21 @@ static void SetupOptions(int argc, const char *argv[], Options* options) {
 
   for (int argi = optind + 1; argi < argc; ++argi)
     options->symbol_paths.push_back(argv[argi]);
+
+  if (options->symbol_paths.empty()) {
+    char *path = getenv("XDG_CACHE_HOME");
+    string cache_home = path ? path : "";
+    if (cache_home.empty()) {
+      path = getenv("HOME");
+      cache_home = path ? path : "";
+      if (!cache_home.empty())
+        cache_home += "/.cache";
+    }
+    if (!cache_home.empty()) {
+      string path = string(cache_home) + "/breakpad/symbols";
+      options->symbol_paths.push_back(path);
+    }
+  }
 }
 
 int main(int argc, const char* argv[]) {
