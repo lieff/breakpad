@@ -49,6 +49,107 @@
 #include "google_breakpad/processor/system_info.h"
 #include "processor/logging.h"
 #include "processor/pathname_stripper.h"
+#include <curl/curl.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
+
+#ifndef __MINGW32__
+#define MKDIRARGS ,0777
+#else
+#define MKDIRARGS
+#endif
+
+struct buffer
+{
+    char *m_buffer;
+    int m_buf_size;
+};
+
+static size_t buffer_write_cb(void *ptr, size_t size, size_t nmemb, void *stream)
+{
+    struct buffer *b = (struct buffer *)stream;
+    int buf_pos = b->m_buf_size;
+    b->m_buf_size += size*nmemb;
+    b->m_buffer = (char*)realloc(b->m_buffer, b->m_buf_size);
+    memcpy(b->m_buffer + buf_pos, ptr, size*nmemb);
+    return size*nmemb;
+}
+
+static char *load_url(const char *url, int *size)
+{
+    struct buffer b = { 0 };
+    CURL *curl;
+    CURLcode res;
+    curl = curl_easy_init();
+    if (!curl)
+        return 0;
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, buffer_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Microsoft-Symbol-Server/6.2.9200.16384");
+    long enable = 1;
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, enable);
+
+    res = curl_easy_perform(curl);
+    if (res != CURLE_OK)
+    {
+        if (b.m_buffer)
+            free(b.m_buffer);
+        printf("curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        return 0;
+    }
+fail:
+    curl_easy_cleanup(curl);
+    *size = b.m_buf_size;
+    //printf("%d readed\n", *size);
+    return b.m_buffer;
+}
+
+static int mkpath(const char *path)
+{
+    char *p = 0;
+    int len = (int)strlen(path);
+    if (len <= 0)
+        return 0;
+
+    char *buffer = (char*)malloc(len + 1);
+    if (!buffer)
+        goto fail;
+    strcpy(buffer, path);
+
+    if (buffer[len - 1] == '/')
+    {
+        buffer[len - 1] = '\0';
+        if (!mkdir(buffer MKDIRARGS))
+        {
+            free(buffer);
+            return 1;
+        }
+        buffer[len - 1] = '/';
+    }
+
+    p = buffer + 1;
+    while (1)
+    {
+        while (*p && *p != '\\' && *p != '/')
+            p++;
+        if (!*p)
+            break;
+        char sav = *p;
+        *p = 0;
+        if ((mkdir(buffer MKDIRARGS) == -1) && (errno == ENOENT))
+            goto fail;
+        *p++ = sav;
+    }
+    free(buffer);
+    return 1;
+fail:
+    printf("error: creating %s failed", path);
+    if (buffer)
+        free(buffer);
+    return 0;
+}
 
 namespace google_breakpad {
 
@@ -154,27 +255,39 @@ SymbolSupplier::SymbolResult SimpleSymbolSupplier::GetSymbolFileAtPathFromRoot(
   string path = root_path;
 
   // Append the debug (pdb) file name as a directory name.
+  // FIXME: some dumps do not have debug_file and debug_identifier
   path.append("/");
   string debug_file_name = PathnameStripper::File(module->debug_file());
+  string code_file = PathnameStripper::File(module->code_file());
+  if (debug_file_name.empty() && code_file.length() > 3) {
+    debug_file_name = code_file.substr(0, code_file.length() - 3) + "pdb";
+    BPLOG(INFO) << "Assuming debug_file = " << debug_file_name;
+  }
   if (debug_file_name.empty()) {
     BPLOG(ERROR) << "Can't construct symbol file path without debug_file "
-                    "(code_file = " <<
-                    PathnameStripper::File(module->code_file()) << ")";
+                    "(code_file = " << code_file << ")";
     return NOT_FOUND;
   }
   path.append(debug_file_name);
 
   // Append the identifier as a directory name.
-  path.append("/");
   string identifier = module->debug_identifier();
-  if (identifier.empty()) {
+  string version = module->version();
+  /*if (identifier.empty()) {
     BPLOG(ERROR) << "Can't construct symbol file path without debug_identifier "
                     "(code_file = " <<
                     PathnameStripper::File(module->code_file()) <<
                     ", debug_file = " << debug_file_name << ")";
     return NOT_FOUND;
+  }*/
+  if (!identifier.empty() || !version.empty()) {
+    // if debug_identifier not found - use version instead
+    path.append("/");
+    if (!identifier.empty())
+      path.append(identifier);
+    else
+      path.append(version);
   }
-  path.append(identifier);
 
   // Transform the debug file name into one ending in .sym.  If the existing
   // name ends in .pdb, strip the .pdb.  Otherwise, add .sym to the non-.pdb
@@ -190,7 +303,32 @@ SymbolSupplier::SymbolResult SimpleSymbolSupplier::GetSymbolFileAtPathFromRoot(
   } else {
     path.append(debug_file_name);
   }
+  string path_pdb = path + ".pdb";
   path.append(".sym");
+
+  if (!file_exists(path)) {
+      int buf_size;
+      string url = string("http://msdl.microsoft.com/download/symbols") + (path_pdb.c_str() + root_path.length());
+      char *data = load_url(url.c_str(), &buf_size);
+      BPLOG(INFO) << "Downloaded: " << url << " ("  << buf_size << " bytes)";
+      mkpath(path_pdb.c_str());
+      FILE *f = fopen(path_pdb.c_str(), "wb");
+      if (f) {
+          fwrite(data, 1, buf_size, f);
+          fclose(f);
+      }
+#ifdef __linux__
+      string convert_cmd = string("wine dump_syms.exe ") + path_pdb + " >" + path;
+#else
+      string convert_cmd = string("dump_syms.exe ") + path_pdb + " >" + path;
+#endif
+      if (!system(convert_cmd.c_str())) {
+          BPLOG(INFO) << "Converted: " << path;
+          unlink(path_pdb.c_str());
+      } else {
+          BPLOG(ERROR) << "Convert fail: " << path;
+      }
+  }
 
   if (!file_exists(path)) {
     BPLOG(INFO) << "No symbol file at " << path;
